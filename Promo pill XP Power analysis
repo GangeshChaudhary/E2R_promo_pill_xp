@@ -1,0 +1,284 @@
+
+---------------------------------------------------------------
+--- eats user who has seen launchpad with rides icon with other targeting criteria
+-- shouldn't be member and have active rides promo 
+
+-- india_growth.promo_pill_xp_base_pa_3 has base data without city_id 
+-- 14 feb to 27 feb and then track trips and GB for 28 days
+---------------------------------------------------------------
+
+set session hash_partition_count=64;
+
+create table india_growth.promo_pill_xp_base_pa_4 as 
+
+  with eats_ssn as (
+        select 
+          user_uuid
+        --  ,session_uuid 
+          , city_id 
+          ,min(datestr)datestr   --- taking the first instance of session at user level
+          
+        from eds.fact_eats_app_event as a, 
+        UNNEST 
+        (event_value_map) AS value_map_table (key, value) --  unnest key, value pairs in value map
+
+        WHERE DATE(datestr) between Date '{{start_date}}' and Date '{{end_date}}'
+        and event_type = 'impression' 
+        and event_name = 'eats_feed_launchpad_impression' 
+        
+        and value like '%launchpad.rides%'
+        group by 1,2 
+        
+        )
+
+, pass_filter as (
+    select distinct
+    l.*
+    , case 
+        when lower(msg.name) like '%uber one%' then 'UBER_ONE'
+        when lower(msg.name) like '%uber%' then 'UBER_PASS'
+        when lower(msg.name) like '%postmates%' then 'Postmates'
+        when lower(msg.name) like '%eats%' then 'EATS_PASS'
+        when lower(msg.name) like '%ride%' then 'RIDES_PASS'
+        when lower(msg.name) like '%hcv%' then 'HCV_PASS'
+        else 'OTHER_PASS' end as pass_type
+    
+    from rawdata.kafka_hp_multipass_pass_offer_updates_nodedup k 
+     join india_growth.subs_purchase_v3 as l 
+     on k.msg.uuid   = l.passofferuuid 
+    
+    where 1=1
+    and date(k.datestr) >= Date('{{start_date}}') - INTERVAL '40' DAY
+    and k.msg.status = 0 --------- exclude test pass 
+   )   
+ 
+ ---- active promo on user account with atleast one ride to take
+
+, active_promo_users as (
+
+  with promo_base as (
+      select distinct client_uuid, promotion_code_uuid 
+         from dwh.fact_promo_apply 
+          where date(Datestr) >= Date ('{{start_date}}') - INTERVAL '40' DAY
+           )
+
+, promo_time as (
+       select b.promotion_code_uuid , b.promotion_trips, b.promotion_uuid, 
+               b.promotion_starts_timestamp, b.promotion_ends_timestamp 
+              ,a.client_uuid          
+
+        from promo_base as a 
+        join  dwh.dim_promotion as b 
+        on a.promotion_code_uuid = b.promotion_code_uuid
+         where date(cast(promotion_ends_timestamp as timestamp)) >=  Date ('{{start_date}}')  -- getting only those promos which are ending post start date
+
+        )
+
+, promo_redeemd as (     
+           select client_uuid, promotion_code_uuid, 
+               count(distinct trip_uuid) trips_used
+            from dwh.fact_promo_redeem 
+             where date(datestr) >= Date ('{{start_date}}') - INTERVAL '40' DAY
+             group by 1,2     
+          
+            )
+    select 
+       a.* , b.trips_used
+      from promo_time as a 
+      join promo_redeemd as b 
+       on a.client_uuid = b.client_uuid 
+       and a.promotion_code_uuid = b.promotion_code_uuid
+       and promotion_trips > trips_used 
+            
+    )
+
+
+    select 
+    a.user_uuid 
+    ,dct.country_name
+    ,a.datestr
+
+    from eats_ssn as a 
+    join dwh.dim_city as dct 
+    on a.city_id = dct.city_id 
+
+    left join pass_filter as b  
+    on  a.user_uuid = b.user_uuid 
+    and pass_type not in ( 'UBER_ONE', 'UBER_PASS', 'RIDES_PASS', 'HCV_PASS') 
+
+    left join active_promo_users as c
+        on a.user_uuid = c.client_uuid 
+        and c.client_uuid is not null 
+       group by 1,2,3
+
+
+
+-- put where in and condition  : change in inner join 
+
+
+-- 496266
+------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------
+
+with rides_GB_trip as(
+         
+         select xp.user_uuid            
+               ,count(ft.uuid) as completed_trips
+               ,coalesce(sum(gross_bookings_usd),0) as gb
+               --   ,count(distinct xp.client_uuid) as riders
+               
+              from india_growth.promo_pill_xp_base_pa_4 xp 
+               left join dwh.fact_trip ft 
+                on ft.client_uuid = xp.user_uuid
+                
+                and date(ft.datestr) BETWEEN DATE('{{start_date}}') and DATE('{{end_date}}') + INTERVAL '28' DAY
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport' 
+                and DATE_DIFF('Day' , cast(xp.datestr as date), cast(ft.datestr as date) ) <= 28
+
+              left join secure_finance.fds_jobs_rides_op_dt fds  
+               on ft.uuid = fds.job_uuid and ft.client_uuid = fds.client_uuid
+               and fds.status = 'COMPLETED'
+               and date(operational_date) between Date '{{start_date}}' and Date '{{end_date}}' + INTERVAL '28' DAY
+               and DATE_DIFF('Day' , cast(xp.datestr as date) , cast(fds.operational_date as date) ) <= 28
+              
+              where xp.country_name in  ('Germany', 'United Kingdom')
+              group by 1
+
+            )
+
+------------
+-- proportion of (user completed trips / user base)
+-- completed trips per user
+-- gb per user
+------------
+
+   select 
+      AVG(COALESCE(active_user,0)) as active_user_mean  
+      ,STDDEV_SAMP(COALESCE(active_user,0)) as active_user_std 
+
+      ,AVG(COALESCE(completed_trips,0)) as completed_trips_mean
+      ,STDDEV_SAMP(COALESCE(completed_trips,0)) as completed_trips_std
+
+      ,AVG(COALESCE(gb,0)) as gb_mean
+      ,STDDEV_SAMP(COALESCE(gb,0)) as gb_std 
+
+    from (
+        select 
+      user_uuid
+      ,completed_trips
+      ,gb
+      ,case when COALESCE(completed_trips,0) > 0 then 1 else 0 end as active_user
+
+     from rides_GB_trip
+      )
+
+
+
+------------------------------------------------------------------------------------
+-- How long it will take to acquire sample size 
+------------------------------------------------------------------------------------
+
+ with eats_ssn as (
+        select 
+          user_uuid
+        --  ,session_uuid 
+          , city_id 
+          ,min(datestr)datestr   --- taking the first instance of session at user level
+          
+        from eds.fact_eats_app_event as a, 
+        UNNEST 
+        (event_value_map) AS value_map_table (key, value) --  unnest key, value pairs in value map
+
+        WHERE DATE(datestr) between Date '{{start_date}}' and Date '{{end_date}}'
+        and event_type = 'impression' 
+        and event_name = 'eats_feed_launchpad_impression' 
+        
+        and value like '%launchpad.rides%'
+        group by 1,2 
+        
+        )
+
+, pass_filter as (
+    select distinct
+    l.*
+    , case 
+        when lower(msg.name) like '%uber one%' then 'UBER_ONE'
+        when lower(msg.name) like '%uber%' then 'UBER_PASS'
+        when lower(msg.name) like '%postmates%' then 'Postmates'
+        when lower(msg.name) like '%eats%' then 'EATS_PASS'
+        when lower(msg.name) like '%ride%' then 'RIDES_PASS'
+        when lower(msg.name) like '%hcv%' then 'HCV_PASS'
+        else 'OTHER_PASS' end as pass_type
+    
+    from rawdata.kafka_hp_multipass_pass_offer_updates_nodedup k 
+     join india_growth.subs_purchase_v3 as l 
+     on k.msg.uuid   = l.passofferuuid 
+    
+    where 1=1
+    and date(k.datestr) >= Date('{{start_date}}') - INTERVAL '40' DAY
+    and k.msg.status = 0 --------- exclude test pass 
+   )   
+ 
+ ---- active promo on user account with atleast one ride to take
+
+, active_promo_users as (
+
+  with promo_base as (
+      select distinct client_uuid, promotion_code_uuid 
+         from dwh.fact_promo_apply 
+          where date(Datestr) >= Date ('{{start_date}}') - INTERVAL '40' DAY
+           )
+
+, promo_time as (
+       select b.promotion_code_uuid , b.promotion_trips, b.promotion_uuid, 
+               b.promotion_starts_timestamp, b.promotion_ends_timestamp 
+              ,a.client_uuid          
+
+        from promo_base as a 
+        join  dwh.dim_promotion as b 
+        on a.promotion_code_uuid = b.promotion_code_uuid
+         where date(cast(promotion_ends_timestamp as timestamp)) >=  Date ('{{start_date}}')  -- getting only those promos which are ending post start date
+
+        )
+
+, promo_redeemd as (     
+           select client_uuid, promotion_code_uuid, 
+               count(distinct trip_uuid) trips_used
+            from dwh.fact_promo_redeem 
+             where date(datestr) >= Date ('{{start_date}}') - INTERVAL '40' DAY
+             group by 1,2     
+          
+            )
+    select 
+       a.* , b.trips_used
+      from promo_time as a 
+      join promo_redeemd as b 
+       on a.client_uuid = b.client_uuid 
+       and a.promotion_code_uuid = b.promotion_code_uuid
+       and promotion_trips > trips_used 
+            
+    )
+
+
+select 
+   count(distinct a.user_uuid) sample
+   
+   from eats_ssn as a 
+    join dwh.dim_city as dct 
+    on a.city_id = dct.city_id 
+
+  left join pass_filter as b  
+   on  a.user_uuid = b.user_uuid 
+   and pass_type not in ( 'UBER_ONE', 'UBER_PASS', 'RIDES_PASS', 'HCV_PASS') 
+
+   left join active_promo_users as c
+    on a.user_uuid = c.client_uuid 
+
+  where c.client_uuid is not null  and dct.country_name in  ('Germany', 'United Kingdom') 
+
+  --- and dct.country_name not in  ('Germany', 'United Kingdom')  
+ --  group by 1,2
+
+
+
